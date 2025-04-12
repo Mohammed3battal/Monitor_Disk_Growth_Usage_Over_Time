@@ -1,0 +1,139 @@
+-- Step 1: Create a new database
+CREATE DATABASE DiskGrowthDB;
+GO
+
+-- Step 2: Use the new database
+USE DiskGrowthDB;
+GO
+
+-- Step 3: Create a table to log disk growth
+CREATE TABLE DiskGrowthLog (
+    LogID INT IDENTITY(1,1) PRIMARY KEY,
+    DriveLetter CHAR(1),
+    TotalSpaceMB DECIMAL(10, 2),
+    FreeSpaceMB DECIMAL(10, 2),
+    UsedSpaceMB AS (TotalSpaceMB - FreeSpaceMB),
+    LogDate DATETIME DEFAULT GETDATE()
+);
+GO
+
+-- Step 4: Create a stored procedure to log the disk usage
+CREATE PROCEDURE LogDiskGrowth
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Temporary table to hold disk space information
+    CREATE TABLE #DiskInfo (
+        DriveLetter CHAR(1),
+        FreeSpaceMB DECIMAL(10, 2)
+    );
+
+    -- Inserting disk information using xp_fixeddrives
+    INSERT INTO #DiskInfo (DriveLetter, FreeSpaceMB)
+    EXEC xp_fixeddrives;
+
+    -- Temp table for total space calculation
+    CREATE TABLE #TotalSpace (
+        DriveLetter CHAR(1),
+        TotalSpaceMB DECIMAL(10, 2)
+    );
+
+    -- Inserting total space information
+    INSERT INTO #TotalSpace (DriveLetter, TotalSpaceMB)
+    SELECT
+        SUBSTRING(physical_name, 1, 1) AS DriveLetter,
+        SUM(size * 8.0 / 1024) AS TotalSpaceMB
+    FROM
+        sys.master_files
+    GROUP BY
+        SUBSTRING(physical_name, 1, 1);
+
+    -- Inserting data into DiskGrowthLog
+    INSERT INTO DiskGrowthLog (DriveLetter, TotalSpaceMB, FreeSpaceMB)
+    SELECT
+        ts.DriveLetter,
+        ts.TotalSpaceMB,
+        di.FreeSpaceMB
+    FROM
+        #TotalSpace ts
+    JOIN
+        #DiskInfo di
+    ON
+        ts.DriveLetter = di.DriveLetter;
+
+    -- Drop temporary tables
+    DROP TABLE #DiskInfo;
+    DROP TABLE #TotalSpace;
+END;
+GO
+
+-- Step 5: Schedule the stored procedure to run at regular intervals (e.g., using SQL Server Agent)
+-- Example SQL Server Agent Job step:
+
+
+EXEC DiskGrowthDB.dbo.LogDiskGrowth;
+
+
+
+-- Step 6: Querying the Data:
+
+--to View All Entries:
+
+SELECT *
+FROM DiskGrowthLog
+ORDER BY LogDate;
+
+--View Disk Usage by Drive Letter:
+
+SELECT 
+    DriveLetter,
+    LogDate,
+    TotalSpaceGB,
+    FreeSpaceGB,
+    UsedSpaceGB
+FROM 
+    DiskGrowthLog
+ORDER BY 
+    DriveLetter, LogDate;
+
+
+
+--View Growth Over Time for a Specific Drive:
+
+SELECT 
+    LogDate,
+    TotalSpaceGB,
+    FreeSpaceGB,
+    UsedSpaceGB
+FROM 
+    DiskGrowthLog
+WHERE 
+    DriveLetter = 'C'  -- Change 'C' to the desired drive letter
+ORDER BY 
+    LogDate;
+
+
+--Calculate Growth Rate:
+
+WITH GrowthCTE AS (
+    SELECT
+        DriveLetter,
+        LogDate,
+        UsedSpaceGB,
+        LAG(UsedSpaceGB) OVER (PARTITION BY DriveLetter ORDER BY LogDate) AS PreviousUsedSpaceGB
+    FROM 
+        DiskGrowthLog
+)
+SELECT
+    DriveLetter,
+    LogDate,
+    UsedSpaceGB,
+    PreviousUsedSpaceGB,
+    (UsedSpaceGB - PreviousUsedSpaceGB) AS GrowthGB
+FROM 
+    GrowthCTE
+WHERE 
+    PreviousUsedSpaceGB IS NOT NULL
+ORDER BY 
+    DriveLetter, LogDate;
