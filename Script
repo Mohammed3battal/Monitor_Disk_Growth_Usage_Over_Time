@@ -10,122 +10,126 @@ GO
 CREATE TABLE DiskGrowthLog (
     LogID INT IDENTITY(1,1) PRIMARY KEY,
     DriveLetter CHAR(1),
-    TotalSpaceMB DECIMAL(10, 2),
-    FreeSpaceMB DECIMAL(10, 2),
+    VolumeMountPoint NVARCHAR(255),
+    TotalSpaceMB DECIMAL(18,2),
+    FreeSpaceMB DECIMAL(18,2),
     UsedSpaceMB AS (TotalSpaceMB - FreeSpaceMB),
     LogDate DATETIME DEFAULT GETDATE()
 );
 GO
 
--- Step 4: Create a stored procedure to log the disk usage
-CREATE PROCEDURE LogDiskGrowth
+-- Step 4: Create the stored procedure
+
+
+CREATE PROCEDURE dbo.LogDiskGrowth
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    -- Temporary table to hold disk space information
-    CREATE TABLE #DiskInfo (
+    -- Temporary table to collect disk info
+    CREATE TABLE #VolumeInfo (
         DriveLetter CHAR(1),
-        FreeSpaceMB DECIMAL(10, 2)
+        VolumeMountPoint NVARCHAR(255),
+        TotalSpaceMB DECIMAL(18,2),
+        FreeSpaceMB DECIMAL(18,2)
     );
 
-    -- Inserting disk information using xp_fixeddrives
-    INSERT INTO #DiskInfo (DriveLetter, FreeSpaceMB)
-    EXEC xp_fixeddrives;
+    -- Collect info from sys.dm_os_volume_stats
+    INSERT INTO #VolumeInfo (DriveLetter, VolumeMountPoint, TotalSpaceMB, FreeSpaceMB)
+    SELECT 
+        LEFT(vs.volume_mount_point, 1) AS DriveLetter,
+        vs.volume_mount_point,
+        vs.total_bytes / 1024.0 / 1024.0 AS TotalSpaceMB,
+        vs.available_bytes / 1024.0 / 1024.0 AS FreeSpaceMB
+    FROM 
+        sys.master_files mf
+    CROSS APPLY 
+        sys.dm_os_volume_stats(mf.database_id, mf.file_id) vs
+    GROUP BY 
+        vs.volume_mount_point, 
+        vs.total_bytes, 
+        vs.available_bytes;
 
-    -- Temp table for total space calculation
-    CREATE TABLE #TotalSpace (
-        DriveLetter CHAR(1),
-        TotalSpaceMB DECIMAL(10, 2)
-    );
+    -- Insert into the main log table
+    INSERT INTO DiskGrowthLog (DriveLetter, VolumeMountPoint, TotalSpaceMB, FreeSpaceMB)
+    SELECT 
+        DriveLetter,
+        VolumeMountPoint,
+        MAX(TotalSpaceMB),
+        MAX(FreeSpaceMB)
+    FROM 
+        #VolumeInfo
+    GROUP BY 
+        DriveLetter, VolumeMountPoint;
 
-    -- Inserting total space information
-    INSERT INTO #TotalSpace (DriveLetter, TotalSpaceMB)
-    SELECT
-        SUBSTRING(physical_name, 1, 1) AS DriveLetter,
-        SUM(size * 8.0 / 1024) AS TotalSpaceMB
-    FROM
-        sys.master_files
-    GROUP BY
-        SUBSTRING(physical_name, 1, 1);
-
-    -- Inserting data into DiskGrowthLog
-    INSERT INTO DiskGrowthLog (DriveLetter, TotalSpaceMB, FreeSpaceMB)
-    SELECT
-        ts.DriveLetter,
-        ts.TotalSpaceMB,
-        di.FreeSpaceMB
-    FROM
-        #TotalSpace ts
-    JOIN
-        #DiskInfo di
-    ON
-        ts.DriveLetter = di.DriveLetter;
-
-    -- Drop temporary tables
-    DROP TABLE #DiskInfo;
-    DROP TABLE #TotalSpace;
+    -- Clean up
+    DROP TABLE #VolumeInfo;
 END;
 GO
 
--- Step 5: Schedule the stored procedure to run at regular intervals (e.g., using SQL Server Agent)
--- Example SQL Server Agent Job step:
 
+-- Step 5: Test it manually
+EXEC dbo.LogDiskGrowth;
+GO
 
-EXEC DiskGrowthDB.dbo.LogDiskGrowth;
+-- Step 6: Querying the Data
 
+-- View all entries
+SELECT 
+    LogID,
+    DriveLetter,
+    VolumeMountPoint,
+    TotalSpaceMB,
+    FreeSpaceMB,
+    UsedSpaceMB,
+    LogDate
+FROM 
+    DiskGrowthLog
+ORDER BY 
+    LogDate DESC;
+GO
 
-
--- Step 6: Querying the Data:
-
---to View All Entries:
-
-SELECT *
-FROM DiskGrowthLog
-ORDER BY LogDate;
-
---View Disk Usage by Drive Letter:
-
+-- View Disk Usage in GB per drive
 SELECT 
     DriveLetter,
+    VolumeMountPoint,
     LogDate,
-    TotalSpaceGB,
-    FreeSpaceGB,
-    UsedSpaceGB
+    TotalSpaceMB / 1024.0 AS TotalSpaceGB,
+    FreeSpaceMB / 1024.0 AS FreeSpaceGB,
+    (TotalSpaceMB - FreeSpaceMB) / 1024.0 AS UsedSpaceGB
 FROM 
     DiskGrowthLog
 ORDER BY 
     DriveLetter, LogDate;
+GO
 
-
-
---View Growth Over Time for a Specific Drive:
+-- View Growth Over Time for Specific Drive
+DECLARE @Drive CHAR(1) = 'C'; -- Change as needed
 
 SELECT 
     LogDate,
-    TotalSpaceGB,
-    FreeSpaceGB,
-    UsedSpaceGB
+    TotalSpaceMB / 1024.0 AS TotalSpaceGB,
+    FreeSpaceMB / 1024.0 AS FreeSpaceGB,
+    (TotalSpaceMB - FreeSpaceMB) / 1024.0 AS UsedSpaceGB
 FROM 
     DiskGrowthLog
 WHERE 
-    DriveLetter = 'C'  -- Change 'C' to the desired drive letter
+    DriveLetter = @Drive
 ORDER BY 
     LogDate;
+GO
 
-
---Calculate Growth Rate:
-
+-- Calculate Growth Rate
 WITH GrowthCTE AS (
-    SELECT
+    SELECT 
         DriveLetter,
         LogDate,
-        UsedSpaceGB,
-        LAG(UsedSpaceGB) OVER (PARTITION BY DriveLetter ORDER BY LogDate) AS PreviousUsedSpaceGB
+        (TotalSpaceMB - FreeSpaceMB) / 1024.0 AS UsedSpaceGB,
+        LAG((TotalSpaceMB - FreeSpaceMB) / 1024.0) OVER (PARTITION BY DriveLetter ORDER BY LogDate) AS PreviousUsedSpaceGB
     FROM 
         DiskGrowthLog
 )
-SELECT
+SELECT 
     DriveLetter,
     LogDate,
     UsedSpaceGB,
@@ -137,3 +141,4 @@ WHERE
     PreviousUsedSpaceGB IS NOT NULL
 ORDER BY 
     DriveLetter, LogDate;
+GO
